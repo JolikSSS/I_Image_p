@@ -85,14 +85,24 @@ def log_to_file(ip, status, details=""):
         print(f"Ошибка записи лога: {e}")
 
 def is_vpn_or_hosting(ip):
-    """Только явные дата-центры (более безопасно)"""
+    """Проверяет, принадлежит ли IP VPN сервису или хостингу"""
     if not ENABLE_VPN_BLOCK:
         return False, None
     
-    if ip.startswith(('127.', '192.168.', '10.', '172.')):
+    # Не блокируем локальные IP
+    if ip.startswith(('127.', '192.168.', '10.', '172.', '169.254.')):
         return False, None
     
-    # Блокируем только известные дата-центры
+    # Список известных VPN IP (можно добавлять вручную)
+    KNOWN_VPN_IPS = [
+        '84.237.55.',  # Пример - сеть, которая у вас заблокировалась
+        # Добавляйте другие подсети при необходимости
+    ]
+    
+    for vpn_network in KNOWN_VPN_IPS:
+        if ip.startswith(vpn_network):
+            return True, f"Known VPN network: {vpn_network}"
+    
     try:
         response = requests.get(f'http://ip-api.com/json/{ip}', timeout=5)
         data = response.json()
@@ -100,48 +110,75 @@ def is_vpn_or_hosting(ip):
         if data.get('status') == 'success':
             asn = data.get('as', '').split()[0] if data.get('as') else ''
             org = data.get('org', '').lower()
+            isp = data.get('isp', '').lower()
             
-            # Блокируем только явные облачные провайдеры
+            # Только явные дата-центры и VPN провайдеры
             if asn in BLOCKED_ASNS:
-                # Исключение для некоторых ASN, которые могут быть обычными пользователями
-                EXCLUDED_ASNS = ['AS12389', 'AS42610']  # Примеры - добавьте свои
-                if asn not in EXCLUDED_ASNS:
-                    return True, f"Cloud provider blocked (ASN: {asn})"
+                return True, f"Datacenter blocked (ASN: {asn})"
             
-            # Блокируем только если организация явно VPN/хостинг
-            VPS_PROVIDERS = ['digitalocean', 'vultr', 'linode', 'aws', 'amazon', 'azure']
-            for provider in VPS_PROVIDERS:
-                if provider in org:
-                    return True, f"VPS provider: {provider}"
+            # Ключевые слова только для явных VPN/хостинг провайдеров
+            VPN_PROVIDERS = ['vpn', 'nordvpn', 'expressvpn', 'protonvpn', 'cyberghost', 'purevpn']
+            HOSTING_PROVIDERS = ['digitalocean', 'aws', 'amazon', 'azure', 'google cloud', 'linode', 'vultr', 'ovh']
+            
+            for provider in VPN_PROVIDERS:
+                if provider in org or provider in isp:
+                    return True, f"VPN provider detected: {provider}"
+            
+            for provider in HOSTING_PROVIDERS:
+                if provider in org or provider in isp:
+                    return True, f"Hosting provider detected: {provider}"
                     
         return False, None
     except:
         return False, None
 
 def check_user_agent():
-    """Проверка только на явных ботов"""
+    """Проверяет User-Agent на ботов (более точная)"""
     user_agent = request.headers.get('User-Agent', '').lower()
     
-    # Только явные боты
+    # Пустой User-Agent - почти всегда бот
+    if not user_agent or user_agent == 'unknown':
+        return True, "Empty User-Agent"
+    
+    # Слишком короткий UA (меньше 20 символов) - подозрительно
+    if len(user_agent) < 20:
+        return True, f"Suspicious short User-Agent ({len(user_agent)} chars)"
+    
+    # Список ботов (только явные)
     BOT_KEYWORDS = [
         'python-requests', 'curl', 'wget', 'go-http-client', 
-        'java', 'perl', 'ruby', 'scrapy', 'httpx', 'okhttp'
+        'java', 'perl', 'ruby', 'scrapy', 'httpx', 'okhttp',
+        'bot', 'crawler', 'scanner', 'nmap', 'masscan', 'zgrab'
     ]
     
     for bot in BOT_KEYWORDS:
         if bot in user_agent:
             return True, f"Bot detected: {bot}"
     
+    # Проверка на нормальные браузеры (не блокируем, а пропускаем)
+    BROWSER_KEYWORDS = ['chrome', 'firefox', 'safari', 'edge', 'opera', 'mobile', 'android', 'iphone', 'ipad']
+    
+    # Если нет признаков браузера и длина UA нормальная - может быть бот
+    if not any(browser in user_agent for browser in BROWSER_KEYWORDS):
+        # Но не блокируем, только логируем как подозрительный
+        return False, None  # Пропускаем, но не блокируем
+    
     return False, None
 
 def check_missing_headers():
-    """Минимальная проверка - только самые явные боты"""
-    user_agent = request.headers.get('User-Agent', '')
+    """Проверяет наличие обязательных браузерных заголовков (более мягкая проверка)"""
+    # Браузеры почти всегда отправляют Accept
+    if not request.headers.get('Accept'):
+        return True, "Missing Accept header"
     
-    # Блокируем только если нет User-Agent И нет Accept
-    if not user_agent and not request.headers.get('Accept'):
-        return True, "Missing both User-Agent and Accept headers"
+    # Accept-Language обычно есть у браузеров, но не всегда у мобильных
+    # Сделаем эту проверку опциональной
+    if not request.headers.get('Accept-Language'):
+        # Не блокируем сразу, только если нет и других признаков
+        if not request.headers.get('Accept') and not request.headers.get('User-Agent'):
+            return True, "Missing browser headers"
     
+    # Убираем проверку Connection - она не критична
     return False, None
 
 # ============= ОСНОВНАЯ ПРОВЕРКА =============
