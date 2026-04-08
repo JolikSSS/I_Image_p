@@ -2,11 +2,13 @@ services:
   - type: web
     name: ip-logger
     env: python
+    region: frankfurt
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
     envVars:
       - key: ADMIN_SECRET_KEY
-        value: xK9#mP2$nL5&qR8@tY3!wE6  # ИЗМЕНИТЕ ЭТО!
+        value: iPlo-Gg-in-N-gJoS123  # ИЗМЕНИТЕ ЭТО!
       - key: ENABLE_VPN_BLOCK
         value: true
       - key: LOG_FILE
