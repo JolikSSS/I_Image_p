@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+visitors.json
+.env
+.DS_Store
