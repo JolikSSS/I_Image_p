@@ -2,5 +2,7 @@ venv/
 __pycache__/
 *.pyc
 visitors.json
+blocked_requests.json
 .env
 .DS_Store
+*.log
