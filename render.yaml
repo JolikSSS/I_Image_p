@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ip-logger
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ENABLE_VPN_BLOCK
+        value: true
+      - key: LOG_FILE
+        value: /opt/render/project/src/visitors.json
