@@ -85,49 +85,28 @@ def log_to_file(ip, status, details=""):
         print(f"Ошибка записи лога: {e}")
 
 def is_vpn_or_hosting(ip):
-    """Проверяет, принадлежит ли IP VPN сервису или хостингу"""
+    """Проверяет IP через ip-api.com на принадлежность к VPN/хостингу"""
     if not ENABLE_VPN_BLOCK:
         return False, None
     
-    # Не блокируем локальные IP
-    if ip.startswith(('127.', '192.168.', '10.', '172.', '169.254.')):
+    if ip.startswith(('127.', '192.168.', '10.', '172.')):
         return False, None
-    
-    # Список известных VPN IP (можно добавлять вручную)
-    KNOWN_VPN_IPS = [
-        '84.237.55.',  # Пример - сеть, которая у вас заблокировалась
-        # Добавляйте другие подсети при необходимости
-    ]
-    
-    for vpn_network in KNOWN_VPN_IPS:
-        if ip.startswith(vpn_network):
-            return True, f"Known VPN network: {vpn_network}"
     
     try:
         response = requests.get(f'http://ip-api.com/json/{ip}', timeout=5)
         data = response.json()
         
         if data.get('status') == 'success':
+            # Используем специальные поля API для определения прокси/хостинга [citation:1]
+            if data.get('proxy') or data.get('hosting'):
+                return True, f"IP is proxy or hosting (proxy={data.get('proxy')}, hosting={data.get('hosting')})"
+            
+            # Дополнительная проверка по ASN хостингов
+            hosting_asns = ['AS13335', 'AS16509', 'AS15169', 'AS20473', 'AS14061']
             asn = data.get('as', '').split()[0] if data.get('as') else ''
-            org = data.get('org', '').lower()
-            isp = data.get('isp', '').lower()
-            
-            # Только явные дата-центры и VPN провайдеры
-            if asn in BLOCKED_ASNS:
-                return True, f"Datacenter blocked (ASN: {asn})"
-            
-            # Ключевые слова только для явных VPN/хостинг провайдеров
-            VPN_PROVIDERS = ['vpn', 'nordvpn', 'expressvpn', 'protonvpn', 'cyberghost', 'purevpn']
-            HOSTING_PROVIDERS = ['digitalocean', 'aws', 'amazon', 'azure', 'google cloud', 'linode', 'vultr', 'ovh']
-            
-            for provider in VPN_PROVIDERS:
-                if provider in org or provider in isp:
-                    return True, f"VPN provider detected: {provider}"
-            
-            for provider in HOSTING_PROVIDERS:
-                if provider in org or provider in isp:
-                    return True, f"Hosting provider detected: {provider}"
-                    
+            if asn in hosting_asns:
+                return True, f"Hosting ASN detected: {asn}"
+                
         return False, None
     except:
         return False, None
